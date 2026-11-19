@@ -1,7 +1,14 @@
 import sys
 import socket
 
+# =============================================================================
+# Parseo y construcción de paquetes (versión TTL, header de 7 bytes)
+# =============================================================================
+
 def parse_packet(IP_packet: bytes) -> dict:
+    # Extrae los campos del header por posición de bytes:
+    # IP (bytes 0-3), puerto (4-5), TTL (6). El resto es el mensaje.
+    # El mensaje se decodifica a str (válido aquí porque no se fragmenta).
     """Header de 7 bytes: IP(4) + puerto(2) + TTL(1) + mensaje."""
     dest_ip = ".".join(str(b) for b in IP_packet[0:4])
     dest_port = int.from_bytes(IP_packet[4:6], byteorder="big")
@@ -10,6 +17,8 @@ def parse_packet(IP_packet: bytes) -> dict:
     return {"ip": dest_ip, "port": dest_port, "ttl": ttl, "msg": message}
 
 def create_packet(parsed_IP_packet: dict) -> bytes:
+    # Operación inversa de parse_packet: arma los bytes a partir del diccionario.
+    # El TTL se escribe como un único byte.
     """Reconstruye los bytes del paquete a partir del diccionario."""
     ip_bytes = bytes(int(p) for p in parsed_IP_packet["ip"].split("."))
     port_bytes = parsed_IP_packet["port"].to_bytes(2, byteorder="big")
@@ -17,7 +26,16 @@ def create_packet(parsed_IP_packet: dict) -> bytes:
     msg_bytes = parsed_IP_packet["msg"].encode("utf-8")
     return ip_bytes + port_bytes + ttl_byte + msg_bytes
 
+
+# =============================================================================
+# Enrutamiento
+# =============================================================================
+
 def check_routes(routes_file_name: str, destination_address: tuple, rr_state: dict):
+    # Lee la tabla de rutas y reúne todas las filas que cubren el destino
+    # (misma IP de red y puerto dentro del rango). Si hay varias de la misma
+    # regla, alterna entre ellas con round-robin. rr_state guarda el índice
+    # de la última ruta usada por regla y debe persistir mientras corre el router.
     """
     Busca todas las rutas que cubren el destino y devuelve la siguiente
     según round-robin. Devuelve (next_hop_ip, next_hop_port) o None.
@@ -28,6 +46,7 @@ def check_routes(routes_file_name: str, destination_address: tuple, rr_state: di
         with open(routes_file_name, "r") as f:
             for line in f:
                 line = line.strip()
+                # Ignora líneas vacías y comentarios
                 if not line or line.startswith("#"):
                     continue
                 parts = line.split()
@@ -46,14 +65,23 @@ def check_routes(routes_file_name: str, destination_address: tuple, rr_state: di
     if not matching_routes:
         return None
 
-    # Round-robin por regla: se guarda el índice por cada área (net, port_ini, port_fin)
+    # Round-robin solo entre reglas idénticas a la primera coincidencia
     area_key = matching_routes[0][0]
     candidates = [hop for area, hop in matching_routes if area == area_key]
     idx = rr_state.get(area_key, 0) % len(candidates)
     rr_state[area_key] = (idx + 1) % len(candidates)
     return candidates[idx]
 
+
+# =============================================================================
+# Programa principal del router
+# =============================================================================
+
 def main():
+    # Levanta el router en (IP, puerto) y procesa paquetes en un bucle.
+    # Si el destino es este router, imprime el mensaje. Si no, verifica el TTL,
+    # consulta la tabla, decrementa el TTL y reenvía al siguiente salto.
+    """Punto de entrada del router."""
     if len(sys.argv) != 4:
         print("Uso correcto: python3 router.py router_IP router_puerto router_rutas.txt")
         sys.exit(1)
@@ -64,10 +92,10 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((router_ip, router_port))
-    print(f"[LISTENING] {router_ip}:{router_port} (rutas: {routes_file})\n")
+    print(f"[LISTENING] Router escuchando en {router_ip}:{router_port} (rutas: {routes_file})...\n")
 
     current = (router_ip, router_port)
-    rr_state = {}
+    rr_state = {}  # estado del round-robin, por regla de tabla
 
     try:
         while True:
@@ -75,10 +103,12 @@ def main():
             parsed = parse_packet(packet_bytes)
             dest = (parsed["ip"], parsed["port"])
 
+            # Entrega local: el paquete es para este router
             if dest == current:
                 print(parsed["msg"])
                 continue
 
+            # Descarte por TTL: un paquete con TTL 0 no se reenvía
             if parsed["ttl"] <= 0:
                 print(f"Se recibió paquete {packet_bytes} con TTL 0")
                 continue
@@ -88,6 +118,7 @@ def main():
                 print(f"No hay rutas hacia {dest} para paquete {packet_bytes}")
                 continue
 
+            # Decrementa el TTL antes de reenviar, luego reconstruye el paquete
             parsed["ttl"] -= 1
             new_packet = create_packet(parsed)
             print(f"redirigiendo paquete {new_packet} con destino final {dest} desde {current} hacia {next_hop}")
@@ -95,6 +126,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[EXIT] Deteniendo router...")
         sock.close()
+
 
 if __name__ == "__main__":
     main()
